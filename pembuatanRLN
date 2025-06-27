@@ -1,0 +1,1260 @@
+# Import libraries yang diperlukan
+import pandas as pd
+import numpy as np
+import folium
+from folium import plugins
+import pulp
+import matplotlib.pyplot as plt
+import seaborn as sns
+from math import radians, sin, cos, sqrt, atan2
+import warnings
+from folium.plugins import PolyLineTextPath
+import itertools
+warnings.filterwarnings('ignore')
+
+# Install seaborn jika belum ada
+try:
+    import seaborn as sns
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'seaborn'])
+    import seaborn as sns
+
+# Set style untuk visualisasi
+plt.style.use('default')
+sns.set_theme()
+
+# Baca data dari CSV
+df_volume = pd.read_csv('Volume.csv')
+df_facilities = pd.read_csv('Data_Fasilitas.csv')
+
+# Pastikan kolom ID tidak ada spasi
+df_volume['ID'] = df_volume['ID'].astype(str).str.strip()
+df_facilities['ID'] = df_facilities['ID'].astype(str).str.strip()
+
+# Cek ID unik di awal script
+if df_facilities['ID'].duplicated().any():
+    print('PERINGATAN: Ada ID fasilitas yang duplikat!')
+    print(df_facilities[df_facilities['ID'].duplicated(keep=False)])
+else:
+    print('Semua ID fasilitas unik.')
+
+# Debug data volume
+print("=== DEBUG DATA VOLUME ===")
+print(f"Total volume dari file: {df_volume['Volume_(Ton)'].sum():.0f} ton")
+for _, row in df_volume.iterrows():
+    print(f"ID: {row['ID']}, Volume: {row['Volume_(Ton)']:.0f} ton")
+print("=" * 30)
+
+# Definisikan warna untuk setiap jenis fasilitas
+facility_colors = {
+    'Collecting Center': 'blue',
+    'Testing Center': 'green',
+    'Repair Center': 'yellow',
+    'Dismantling Center': 'orange',
+    'Recycling Center': 'purple',
+    'Cascade Utilization': 'brown',
+    'Waste Treatment': 'red',
+    'Manufacturing Center': 'pink'
+}
+
+# Parameter kapasitas fasilitas (ton) 
+capacity_params = {
+    'Testing Center': 10000,      
+    'Repair Center': 6000,        
+    'Dismantling Center': 5000,   
+    'Recycling Center': 2000,     
+    'Waste Treatment': 2000,      
+    'Cascade Utilization': 5000,  
+    'Manufacturing Center': 5000  
+}
+
+# Parameter biaya tetap tahunan (Rp)
+fixed_costs = {
+    'Collecting Center': 1000000.0,
+    'Testing Center': 1250000.0,
+    'Repair Center': 1460000.0,
+    'Dismantling Center': 1250000.0,
+    'Recycling Center': 1190000.0,
+    'Waste Treatment': 1000000.0,
+    'Cascade Utilization': 1500000.0,
+    'Manufacturing Center': 2000000.0
+}
+
+# Parameter biaya pemrosesan (Rp/ton)
+processing_costs = {
+    'Collecting Center': 2268000.0,
+    'Testing Center': 7940000.0,
+    'Repair Center': 9074000.0,
+    'Dismantling Center': 7940000.0,
+    'Recycling Center': 1134000.0,
+    'Waste Treatment': 5000000.0,
+    'Cascade Utilization': 3000000.0,
+    'Manufacturing Center': 4000000.0
+}
+
+# Parameter emisi karbon (ton CO2/ton)
+carbon_emission = {
+    'Testing Center': 0.64,
+    'Repair Center': 1.5,
+    'Dismantling Center': 3.51,
+    'Recycling Center': 2.25,
+    'Waste Treatment': 1.0,
+    'Cascade Utilization': 0.5,
+    'Manufacturing Center': 1.2
+}
+
+# Biaya transportasi dan faktor emisi
+transport_cost = 1000  # Rp/ton/km
+carbon_factor = 0.00026  # ton CO2/ton/km
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Menghitung jarak antara dua titik koordinat dalam kilometer"""
+    R = 6371  # Radius bumi dalam kilometer
+
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    distance = R * c
+
+    return distance
+
+def create_distance_matrix(df_facilities):
+    """Membuat matriks jarak antar fasilitas"""
+    facilities = df_facilities['ID'].unique()
+    distance_matrix = pd.DataFrame(index=facilities, columns=facilities)
+
+    for i in facilities:
+        for j in facilities:
+            if i != j:
+                loc1 = df_facilities[df_facilities['ID'] == i].iloc[0]
+                loc2 = df_facilities[df_facilities['ID'] == j].iloc[0]
+                distance = calculate_distance(loc1['Latitude'], loc1['Longitude'],
+                                           loc2['Latitude'], loc2['Longitude'])
+                distance_matrix.loc[i, j] = distance
+            else:
+                distance_matrix.loc[i, j] = 0
+
+    return distance_matrix.astype(float)
+
+def create_flow_map(df_facilities, flows, title, filename, allowed_facility_types=None):
+    center_lat = df_facilities['Latitude'].mean()
+    center_lon = df_facilities['Longitude'].mean()
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
+
+    # Filter fasilitas jika diminta
+    if allowed_facility_types is not None:
+        df_facilities = df_facilities[df_facilities['Fasilitas'].isin(allowed_facility_types)]
+
+    # Marker untuk setiap fasilitas yang relevan
+    for _, row in df_facilities.iterrows():
+        volume_in = sum([flow for (source, target), flow in flows.items() if target == row['ID']])
+        volume_out = sum([flow for (source, target), flow in flows.items() if source == row['ID']])
+        popup_text = f"""
+        <b>{row['Fasilitas']}</b><br>
+        Nama: {row['Nama_Lokasi']}<br>
+        ID: {row['ID']}<br>
+        Volume Masuk: {volume_in:.0f} ton<br>
+        Volume Keluar: {volume_out:.0f} ton
+        """
+        color = facility_colors.get(row['Fasilitas'], 'gray')
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=8,
+            popup=folium.Popup(popup_text, max_width=300),
+            color=color,
+            fill=True
+        ).add_to(m)
+
+    # Garis lintasan dengan arah (karakter panah) dan warna sesuai fasilitas pengirim
+    for (source, target), flow in flows.items():
+        if flow > 0:
+            source_row = df_facilities[df_facilities['ID'] == source]
+            target_row = df_facilities[df_facilities['ID'] == target]
+            if source_row.empty or target_row.empty:
+                continue
+            source_row = source_row.iloc[0]
+            target_row = target_row.iloc[0]
+            color = facility_colors.get(source_row['Fasilitas'], 'black')
+            locations = [
+                [source_row['Latitude'], source_row['Longitude']],
+                [target_row['Latitude'], target_row['Longitude']]
+            ]
+            line = folium.PolyLine(
+                locations=locations,
+                weight=4,
+                color=color,
+                opacity=0.8
+            ).add_to(m)
+            # Tambahkan arah dengan karakter panah dan label volume
+            PolyLineTextPath(
+                line,
+                f'  {flow:.0f} ton  →  ',
+                repeat=False,
+                offset=7,
+                attributes={'fill': color, 'font-weight': 'bold', 'font-size': '12'}
+            ).add_to(m)
+
+    # Legend
+    legend_html = '''<div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white;
+    padding: 10px; border: 2px solid grey; border-radius: 5px;">
+    <p><strong>Legend</strong></p>'''
+    for facility, color in facility_colors.items():
+        if allowed_facility_types is None or facility in allowed_facility_types:
+            legend_html += f'<p><span style="color:{color}">●</span> {facility}</p>'
+    legend_html += '</div>'
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    m.save(f'{filename}.html')
+    return m
+
+# Buat matriks jarak
+distance_matrix = create_distance_matrix(df_facilities)
+
+def debug_node_balance(flows, node_list, node_type):
+    print(f"--- Debug Input/Output untuk {node_type} ---")
+    for node in node_list:
+        masuk = sum([v for (src, tgt), v in flows.items() if tgt == node])
+        keluar = sum([v for (src, tgt), v in flows.items() if src == node])
+        print(f"{node_type} {node}: IN = {masuk:.0f}, OUT = {keluar:.0f}")
+        if abs(masuk - keluar) > 0.01:
+            print(f"  ⚠️  PERINGATAN: Ada volume tertinggal {masuk-keluar:.0f} ton!")
+    print("------------------------------------------")
+
+def validate_flow_balance(all_flows):
+    """Validasi keseimbangan input-output di semua fasilitas"""
+    print("=== VALIDASI KESEIMBANGAN FLOW ===")
+    
+    for facility_id in df_facilities['ID'].unique():
+        volume_in = sum([v for (src, tgt), v in all_flows.items() if tgt == facility_id])
+        volume_out = sum([v for (src, tgt), v in all_flows.items() if src == facility_id])
+        
+        if abs(volume_in - volume_out) > 0.01:
+            print(f"❌ {facility_id}: IN={volume_in:.0f}, OUT={volume_out:.0f}, SELISIH={volume_in-volume_out:.0f}")
+        else:
+            print(f"✅ {facility_id}: IN={volume_in:.0f}, OUT={volume_out:.0f}")
+    
+    print("=" * 40)
+
+def debug_volume_balance(df_volume, flows):
+    print("=== DEBUG KESEIMBANGAN VOLUME ===")
+    collection_centers = df_facilities[df_facilities['Fasilitas'] == 'Collecting Center']['ID'].tolist()
+    
+    total_asli = 0
+    total_keluar = 0
+    
+    for cc_id in collection_centers:
+        # Volume asli dari file
+        volume_asli = df_volume[df_volume['ID'] == cc_id]['Volume_(Ton)'].iloc[0]
+        total_asli += volume_asli
+        
+        # Volume keluar dari model
+        volume_keluar = sum([v for (src, tgt), v in flows.items() if src == cc_id])
+        total_keluar += volume_keluar
+        
+        print(f"Collection Center {cc_id}:")
+        print(f"  Volume Asli: {volume_asli:.0f}")
+        print(f"  Volume Keluar: {volume_keluar:.0f}")
+        print(f"  Selisih: {volume_asli - volume_keluar:.0f}")
+        print(f"  Status: {'✅ SEIMBANG' if abs(volume_asli - volume_keluar) < 0.01 else '❌ TIDAK SEIMBANG'}")
+        print()
+    
+    print(f"TOTAL ASLI: {total_asli:.0f} ton")
+    print(f"TOTAL KELUAR: {total_keluar:.0f} ton")
+    print(f"SELISIH TOTAL: {total_asli - total_keluar:.0f} ton")
+    print("=" * 40)
+
+# Alur 1: Collection → Testing (DIPERBAIKI)
+def optimize_collection_to_testing(df_volume):
+    # Siapkan data untuk optimasi
+    collection_centers = df_facilities[df_facilities['Fasilitas'] == 'Collecting Center']['ID'].tolist()
+    testing_centers = df_facilities[df_facilities['Fasilitas'] == 'Testing Center']['ID'].tolist()
+
+    print(f"Collection Centers: {collection_centers}")
+    print(f"Testing Centers: {testing_centers}")
+
+    # Buat model optimasi
+    model = pulp.LpProblem("Collection_to_Testing_Optimization", pulp.LpMinimize)
+
+    # Variabel keputusan
+    x = pulp.LpVariable.dicts("flow",
+                             ((i, j) for i in collection_centers for j in testing_centers),
+                             lowBound=0,
+                             cat='Continuous')
+
+    y = pulp.LpVariable.dicts("open",
+                             testing_centers,
+                             cat='Binary')
+
+    # Fungsi tujuan
+    transport_cost_expr = pulp.lpSum(x[i,j] * distance_matrix.loc[i,j] * transport_cost
+                                    for i in collection_centers for j in testing_centers)
+
+    fixed_cost_expr = pulp.lpSum(y[j] * fixed_costs['Testing Center']
+                                for j in testing_centers)
+
+    processing_cost_expr = pulp.lpSum(x[i,j] * processing_costs['Testing Center']
+                                     for i in collection_centers for j in testing_centers)
+
+    carbon_emission_expr = pulp.lpSum(x[i,j] * distance_matrix.loc[i,j] * carbon_factor
+                                     for i in collection_centers for j in testing_centers)
+
+    model += transport_cost_expr + fixed_cost_expr + processing_cost_expr + (30000 * carbon_emission_expr)
+
+    # Constraints
+    # 1. Setiap collection center harus mengirim semua volumenya
+    for i in collection_centers:
+        volume_data = df_volume[df_volume['ID'] == i]
+        if volume_data.empty:
+            print(f"⚠️  PERINGATAN: ID {i} tidak ditemukan di data volume!")
+            continue
+        volume = volume_data['Volume_(Ton)'].iloc[0]
+        print(f"Collection Center {i}: Volume asli = {volume:.0f}")
+        
+        # Constraint: total keluar = volume asli
+        model += pulp.lpSum(x[i,j] for j in testing_centers) == volume, f"Volume_{i}"
+
+    # 2. Kapasitas testing center
+    for j in testing_centers:
+        model += pulp.lpSum(x[i,j] for i in collection_centers) <= capacity_params['Testing Center'] * y[j], f"Capacity_{j}"
+
+    # 3. Minimal 1 testing center harus dibuka
+    model += pulp.lpSum(y[j] for j in testing_centers) >= 2, "Min_Testing_Centers"
+
+    # Solve model
+    model.solve()
+
+    # Tampilkan hasil
+    print(f"Status: {pulp.LpStatus[model.status]}")
+    print(f"Total Cost: Rp {pulp.value(model.objective):,.2f}")
+
+    # Simpan hasil alur dengan pembulatan
+    flows = {}
+    for i in collection_centers:
+        for j in testing_centers:
+            if pulp.value(x[i,j]) > 0:
+                rounded_value = round(pulp.value(x[i,j]))  # Bulatkan ke integer
+                flows[(i,j)] = rounded_value
+
+    # Debug hasil
+    debug_volume_balance(df_volume, flows)
+
+    # Visualisasi hasil
+    m = create_flow_map(df_facilities, flows, "Collection to Testing Flow", "collection_to_testing")
+
+    # Simpan hasil ke Excel
+    results_df = pd.DataFrame([
+        {
+            'Source': i,
+            'Target': j,
+            'Volume': flows[(i,j)],
+            'Distance': distance_matrix.loc[i,j],
+            'Transport Cost': flows[(i,j)] * distance_matrix.loc[i,j] * transport_cost,
+            'Carbon Emission': flows[(i,j)] * distance_matrix.loc[i,j] * carbon_factor
+        }
+        for i in collection_centers for j in testing_centers
+        if (i,j) in flows
+    ])
+
+    results_df.to_excel('collection_to_testing_results.xlsx', index=False)
+
+    debug_node_balance(flows, testing_centers, "Testing Center")
+
+    return flows, results_df
+
+# Alur 2: Testing → Repair/Dismantling (DIPERBAIKI dengan proporsi yang benar)
+def optimize_testing_to_repair_dismantling(df_volume, collection_to_testing_flows):
+    # Siapkan data untuk optimasi
+    testing_centers = df_facilities[df_facilities['Fasilitas'] == 'Testing Center']['ID'].tolist()
+    repair_centers = df_facilities[df_facilities['Fasilitas'] == 'Repair Center']['ID'].tolist()
+    dismantling_centers = df_facilities[df_facilities['Fasilitas'] == 'Dismantling Center']['ID'].tolist()
+
+    # Parameter fuzzy (ω1, ω2) - proporsi yang diinginkan
+    alpha = 0.85
+    omega1 = (0.55, 0.6, 0.65)  # Repair (60% ± 5%)
+    omega2 = (0.35, 0.4, 0.45)  # Dismantling (40% ± 5%)
+    omega1_val = (1-alpha)*omega1[0] + alpha*omega1[1]  # ≈ 0.58
+    omega2_val = (1-alpha)*omega2[0] + alpha*omega2[1]  # ≈ 0.42
+
+    # Buat model optimasi
+    model = pulp.LpProblem("Testing_to_Repair_Dismantling_Optimization", pulp.LpMinimize)
+
+    # Variabel keputusan
+    Akm = pulp.LpVariable.dicts("Akm", ((k, m) for k in testing_centers for m in repair_centers), lowBound=0, cat='Continuous')
+    Akp = pulp.LpVariable.dicts("Akp", ((k, p) for k in testing_centers for p in dismantling_centers), lowBound=0, cat='Continuous')
+    ym = pulp.LpVariable.dicts("open_repair", repair_centers, cat='Binary')
+    yp = pulp.LpVariable.dicts("open_dismantling", dismantling_centers, cat='Binary')
+
+    # Fungsi tujuan
+    transport_cost_expr = pulp.lpSum(Akm[k,m] * distance_matrix.loc[k,m] * transport_cost for k in testing_centers for m in repair_centers) + \
+    pulp.lpSum(Akp[k,p] * distance_matrix.loc[k,p] * transport_cost for k in testing_centers for p in dismantling_centers)
+
+    fixed_cost_expr = pulp.lpSum(ym[m] * fixed_costs['Repair Center'] for m in repair_centers) + \
+    pulp.lpSum(yp[p] * fixed_costs['Dismantling Center'] for p in dismantling_centers)
+
+    processing_cost_expr = pulp.lpSum(Akm[k,m] * processing_costs['Repair Center'] for k in testing_centers for m in repair_centers) + \
+    pulp.lpSum(Akp[k,p] * processing_costs['Dismantling Center'] for k in testing_centers for p in dismantling_centers)
+
+    carbon_emission_expr = pulp.lpSum(Akm[k,m] * distance_matrix.loc[k,m] * carbon_factor for k in testing_centers for m in repair_centers) + \
+    pulp.lpSum(Akp[k,p] * distance_matrix.loc[k,p] * carbon_factor for k in testing_centers for p in dismantling_centers)
+
+    model += transport_cost_expr + fixed_cost_expr + processing_cost_expr + (30000 * carbon_emission_expr)
+
+    # PERBAIKAN: Constraint keseimbangan + proporsi yang benar
+    for k in testing_centers:
+        total_in = sum([flow for (i,j), flow in collection_to_testing_flows.items() if j == k])
+        
+        # Constraint keseimbangan total
+        model += (pulp.lpSum(Akm[k,m] for m in repair_centers) + 
+                  pulp.lpSum(Akp[k,p] for p in dismantling_centers)) == total_in, f"Balance_Testing_{k}"
+        
+        # PERBAIKAN: Tambahkan constraint proporsi yang ketat
+        # Minimal 55% ke Repair Center
+        model += pulp.lpSum(Akm[k,m] for m in repair_centers) >= omega1[0] * total_in, f"Min_Repair_{k}"
+        # Maksimal 65% ke Repair Center
+        model += pulp.lpSum(Akm[k,m] for m in repair_centers) <= omega1[2] * total_in, f"Max_Repair_{k}"
+        
+        # Minimal 35% ke Dismantling Center
+        model += pulp.lpSum(Akp[k,p] for p in dismantling_centers) >= omega2[0] * total_in, f"Min_Dismantling_{k}"
+        # Maksimal 45% ke Dismantling Center
+        model += pulp.lpSum(Akp[k,p] for p in dismantling_centers) <= omega2[2] * total_in, f"Max_Dismantling_{k}"
+
+    # Kapasitas repair center
+    for m in repair_centers:
+        model += pulp.lpSum(Akm[k,m] for k in testing_centers) <= capacity_params['Repair Center'] * ym[m], f"Capacity_Repair_{m}"
+
+    # Kapasitas dismantling center
+    for p in dismantling_centers:
+        model += pulp.lpSum(Akp[k,p] for k in testing_centers) <= capacity_params['Dismantling Center'] * yp[p], f"Capacity_Dismantling_{p}"
+
+    # Minimal 1 repair dan 1 dismantling center dibuka
+    model += pulp.lpSum(ym[m] for m in repair_centers) >= 2, "Min_Repair_Centers"
+    model += pulp.lpSum(yp[p] for p in dismantling_centers) >= 2, "Min_Dismantling_Centers"
+
+    # Solve model
+    model.solve()
+
+    # Tampilkan hasil
+    print(f"Status: {pulp.LpStatus[model.status]}")
+    print(f"Total Cost: Rp {pulp.value(model.objective):,.2f}")
+
+    # Debug proporsi hasil
+    print("\n=== DEBUG PROPORSI REPAIR vs DISMANTLING ===")
+    total_repair = 0
+    total_dismantling = 0
+    
+    for k in testing_centers:
+        total_in = sum([flow for (i,j), flow in collection_to_testing_flows.items() if j == k])
+        repair_out = sum([pulp.value(Akm[k,m]) for m in repair_centers])
+        dismantling_out = sum([pulp.value(Akp[k,p]) for p in dismantling_centers])
+        
+        total_repair += repair_out
+        total_dismantling += dismantling_out
+        
+        print(f"Testing Center {k}:")
+        print(f"  Total Input: {total_in:.0f} ton")
+        print(f"  Ke Repair: {repair_out:.0f} ton ({repair_out/total_in*100:.1f}%)")
+        print(f"  Ke Dismantling: {dismantling_out:.0f} ton ({dismantling_out/total_in*100:.1f}%)")
+        print()
+    
+    total_all = total_repair + total_dismantling
+    print(f"TOTAL KESELURUHAN:")
+    print(f"  Ke Repair: {total_repair:.0f} ton ({total_repair/total_all*100:.1f}%)")
+    print(f"  Ke Dismantling: {total_dismantling:.0f} ton ({total_dismantling/total_all*100:.1f}%)")
+    print("=" * 50)
+
+    # Simpan hasil alur dengan pembulatan
+    flows = {}
+    for k in testing_centers:
+        for m in repair_centers:
+            if pulp.value(Akm[k,m]) > 0:
+                rounded_value = round(pulp.value(Akm[k,m]))
+                flows[(k,m)] = rounded_value
+        for p in dismantling_centers:
+            if pulp.value(Akp[k,p]) > 0:
+                rounded_value = round(pulp.value(Akp[k,p]))
+                flows[(k,p)] = rounded_value
+
+    # Visualisasi hasil
+    m = create_flow_map(df_facilities, flows, "Testing to Repair/Dismantling Flow", "testing_to_repair_dismantling")
+
+    # Simpan hasil ke Excel
+    results_df = pd.DataFrame([
+        {
+            'Source': k,
+            'Target': m,
+            'Volume': flows[(k,m)],
+            'Distance': distance_matrix.loc[k,m],
+            'Transport Cost': flows[(k,m)] * distance_matrix.loc[k,m] * transport_cost,
+            'Carbon Emission': flows[(k,m)] * distance_matrix.loc[k,m] * carbon_factor
+        }
+        for k in testing_centers for m in repair_centers
+        if (k,m) in flows
+    ] + [
+        {
+            'Source': k,
+            'Target': p,
+            'Volume': flows[(k,p)],
+            'Distance': distance_matrix.loc[k,p],
+            'Transport Cost': flows[(k,p)] * distance_matrix.loc[k,p] * transport_cost,
+            'Carbon Emission': flows[(k,p)] * distance_matrix.loc[k,p] * carbon_factor
+        }
+        for k in testing_centers for p in dismantling_centers
+        if (k,p) in flows
+    ])
+
+    results_df.to_excel('testing_to_repair_dismantling_results.xlsx', index=False)
+
+    debug_node_balance(flows, repair_centers + dismantling_centers, "Repair/Dismantling Center")
+
+    return flows, results_df
+
+# Alur 3: Dismantling → Recycling/Waste (DIPERBAIKI dengan proporsi yang benar)
+def optimize_dismantling_to_recycling_waste(testing_to_repair_dismantling_flows):
+    # Siapkan data untuk optimasi
+    dismantling_centers = df_facilities[df_facilities['Fasilitas'] == 'Dismantling Center']['ID'].tolist()
+    recycling_centers = df_facilities[df_facilities['Fasilitas'] == 'Recycling Center']['ID'].tolist()
+    waste_centers = df_facilities[df_facilities['Fasilitas'] == 'Waste Treatment']['ID'].tolist()
+
+    # Parameter fuzzy (λ1, λ2) - proporsi yang diinginkan
+    alpha = 0.85
+    lambda1 = (0.67, 0.72, 0.77)  # Recycling (72% ± 5%)
+    lambda2 = (0.23, 0.28, 0.33)  # Waste Treatment (28% ± 5%)
+    lambda1_val = (1-alpha)*lambda1[0] + alpha*lambda1[1]  # ≈ 0.70
+    lambda2_val = (1-alpha)*lambda2[0] + alpha*lambda2[1]  # ≈ 0.30
+
+    # Buat model optimasi
+    model = pulp.LpProblem("Dismantling_to_Recycling_Waste_Optimization", pulp.LpMinimize)
+
+    # Variabel keputusan
+    Apq = pulp.LpVariable.dicts("Apq", ((p, q) for p in dismantling_centers for q in recycling_centers), lowBound=0, cat='Continuous')
+    Apu = pulp.LpVariable.dicts("Apu", ((p, u) for p in dismantling_centers for u in waste_centers), lowBound=0, cat='Continuous')
+    yq = pulp.LpVariable.dicts("open_recycling", recycling_centers, cat='Binary')
+    yu = pulp.LpVariable.dicts("open_waste", waste_centers, cat='Binary')
+
+    # Fungsi tujuan
+    transport_cost_expr = pulp.lpSum(Apq[p,q] * distance_matrix.loc[p,q] * transport_cost for p in dismantling_centers for q in recycling_centers) + \
+    pulp.lpSum(Apu[p,u] * distance_matrix.loc[p,u] * transport_cost for p in dismantling_centers for u in waste_centers)
+
+    fixed_cost_expr = pulp.lpSum(yq[q] * fixed_costs['Recycling Center'] for q in recycling_centers) + \
+    pulp.lpSum(yu[u] * fixed_costs['Waste Treatment'] for u in waste_centers)
+
+    processing_cost_expr = pulp.lpSum(Apq[p,q] * processing_costs['Recycling Center'] for p in dismantling_centers for q in recycling_centers) + \
+    pulp.lpSum(Apu[p,u] * processing_costs['Waste Treatment'] for p in dismantling_centers for u in waste_centers)
+
+    carbon_emission_expr = pulp.lpSum(Apq[p,q] * distance_matrix.loc[p,q] * carbon_factor for p in dismantling_centers for q in recycling_centers) + \
+    pulp.lpSum(Apu[p,u] * distance_matrix.loc[p,u] * carbon_factor for p in dismantling_centers for u in waste_centers)
+
+    model += transport_cost_expr + fixed_cost_expr + processing_cost_expr + (30000 * carbon_emission_expr)
+
+    # PERBAIKAN: Constraint keseimbangan + proporsi yang benar
+    for p in dismantling_centers:
+        total_in = sum([flow for (k,pp), flow in testing_to_repair_dismantling_flows.items() if pp == p])
+        
+        # Constraint keseimbangan total
+        model += (pulp.lpSum(Apq[p,q] for q in recycling_centers) + 
+                  pulp.lpSum(Apu[p,u] for u in waste_centers)) == total_in, f"Balance_Dismantling_{p}"
+        
+        # PERBAIKAN: Tambahkan constraint proporsi yang ketat
+        # Minimal 67% ke Recycling Center
+        model += pulp.lpSum(Apq[p,q] for q in recycling_centers) >= lambda1[0] * total_in, f"Min_Recycling_{p}"
+        # Maksimal 77% ke Recycling Center
+        model += pulp.lpSum(Apq[p,q] for q in recycling_centers) <= lambda1[2] * total_in, f"Max_Recycling_{p}"
+        
+        # Minimal 23% ke Waste Treatment
+        model += pulp.lpSum(Apu[p,u] for u in waste_centers) >= lambda2[0] * total_in, f"Min_Waste_{p}"
+        # Maksimal 33% ke Waste Treatment
+        model += pulp.lpSum(Apu[p,u] for u in waste_centers) <= lambda2[2] * total_in, f"Max_Waste_{p}"
+
+    # Kapasitas recycling center
+    for q in recycling_centers:
+        model += pulp.lpSum(Apq[p,q] for p in dismantling_centers) <= capacity_params['Recycling Center'] * yq[q]
+
+    # Kapasitas waste treatment
+    for u in waste_centers:
+        model += pulp.lpSum(Apu[p,u] for p in dismantling_centers) <= capacity_params['Waste Treatment'] * yu[u]
+
+    # Minimal 1 recycling dan 1 waste treatment dibuka
+    model += pulp.lpSum(yq[q] for q in recycling_centers) >= 1
+    model += pulp.lpSum(yu[u] for u in waste_centers) >= 1
+
+    # Solve model
+    model.solve()
+
+    # Tampilkan hasil
+    print(f"Status: {pulp.LpStatus[model.status]}")
+    print(f"Total Cost: Rp {pulp.value(model.objective):,.2f}")
+
+    # Debug proporsi hasil
+    print("\n=== DEBUG PROPORSI RECYCLING vs WASTE ===")
+    total_recycling = 0
+    total_waste = 0
+    
+    for p in dismantling_centers:
+        total_in = sum([flow for (k,pp), flow in testing_to_repair_dismantling_flows.items() if pp == p])
+        recycling_out = sum([pulp.value(Apq[p,q]) for q in recycling_centers])
+        waste_out = sum([pulp.value(Apu[p,u]) for u in waste_centers])
+        
+        total_recycling += recycling_out
+        total_waste += waste_out
+        
+        print(f"Dismantling Center {p}:")
+        print(f"  Total Input: {total_in:.0f} ton")
+        print(f"  Ke Recycling: {recycling_out:.0f} ton ({recycling_out/total_in*100:.1f}%)")
+        print(f"  Ke Waste: {waste_out:.0f} ton ({waste_out/total_in*100:.1f}%)")
+        print()
+    
+    total_all = total_recycling + total_waste
+    print(f"TOTAL KESELURUHAN:")
+    print(f"  Ke Recycling: {total_recycling:.0f} ton ({total_recycling/total_all*100:.1f}%)")
+    print(f"  Ke Waste: {total_waste:.0f} ton ({total_waste/total_all*100:.1f}%)")
+    print("=" * 50)
+
+    # Simpan hasil alur dengan pembulatan
+    flows = {}
+    for p in dismantling_centers:
+        for q in recycling_centers:
+            if pulp.value(Apq[p,q]) > 0:
+                rounded_value = round(pulp.value(Apq[p,q]))
+                flows[(p,q)] = rounded_value
+        for u in waste_centers:
+            if pulp.value(Apu[p,u]) > 0:
+                rounded_value = round(pulp.value(Apu[p,u]))
+                flows[(p,u)] = rounded_value
+
+    # Visualisasi hasil
+    m = create_flow_map(df_facilities, flows, "Dismantling to Recycling/Waste Flow", "dismantling_to_recycling_waste")
+
+    # Simpan hasil ke Excel
+    results_df = pd.DataFrame([
+        {
+            'Source': p,
+            'Target': q,
+            'Volume': flows[(p,q)],
+            'Distance': distance_matrix.loc[p,q],
+            'Transport Cost': flows[(p,q)] * distance_matrix.loc[p,q] * transport_cost,
+            'Carbon Emission': flows[(p,q)] * distance_matrix.loc[p,q] * carbon_factor
+        }
+        for p in dismantling_centers for q in recycling_centers
+        if (p,q) in flows
+    ] + [
+        {
+            'Source': p,
+            'Target': u,
+            'Volume': flows[(p,u)],
+            'Distance': distance_matrix.loc[p,u],
+            'Transport Cost': flows[(p,u)] * distance_matrix.loc[p,u] * transport_cost,
+            'Carbon Emission': flows[(p,u)] * distance_matrix.loc[p,u] * carbon_factor
+        }
+        for p in dismantling_centers for u in waste_centers
+        if (p,u) in flows
+    ])
+
+    results_df.to_excel('dismantling_to_recycling_waste_results.xlsx', index=False)
+
+    debug_node_balance(flows, recycling_centers + waste_centers, "Recycling/Waste Center")
+
+    return flows, results_df
+
+# Alur 4: Repair → Cascade, Recycling → Waste/Manufacturing (DIPERBAIKI dengan proporsi yang benar)
+def optimize_repair_to_cascade_recycling_to_waste_manufacturing(testing_to_repair_dismantling_flows, dismantling_to_recycling_waste_flows):
+    # Siapkan data untuk optimasi
+    repair_centers = df_facilities[df_facilities['Fasilitas'] == 'Repair Center']['ID'].tolist()
+    cascade_centers = df_facilities[df_facilities['Fasilitas'] == 'Cascade Utilization']['ID'].tolist()
+    recycling_centers = df_facilities[df_facilities['Fasilitas'] == 'Recycling Center']['ID'].tolist()
+    waste_centers = df_facilities[df_facilities['Fasilitas'] == 'Waste Treatment']['ID'].tolist()
+    manufacturing_centers = df_facilities[df_facilities['Fasilitas'] == 'Manufacturing Center']['ID'].tolist()
+
+    # Parameter fuzzy (θ1, θ2) - proporsi yang diinginkan
+    alpha = 0.85
+    theta1 = (0.85, 0.9, 0.95)  # Recycling to Manufacturing (90% ± 5%)
+    theta2 = (0.05, 0.1, 0.15)  # Recycling to Waste (10% ± 5%)
+    theta1_val = (1-alpha)*theta1[0] + alpha*theta1[1]  # ≈ 0.88
+    theta2_val = (1-alpha)*theta2[0] + alpha*theta2[1]  # ≈ 0.12
+
+    # Buat model optimasi
+    model = pulp.LpProblem("Repair_to_Cascade_Recycling_to_Waste_Manufacturing_Optimization", pulp.LpMinimize)
+
+    # Variabel keputusan
+    Amn = pulp.LpVariable.dicts("Amn", ((m, n) for m in repair_centers for n in cascade_centers), lowBound=0, cat='Continuous')
+    Aqw = pulp.LpVariable.dicts("Aqw", ((q, w) for q in recycling_centers for w in manufacturing_centers), lowBound=0, cat='Continuous')
+    Aqu = pulp.LpVariable.dicts("Aqu", ((q, u) for q in recycling_centers for u in waste_centers), lowBound=0, cat='Continuous')
+    yn = pulp.LpVariable.dicts("open_cascade", cascade_centers, cat='Binary')
+    yw = pulp.LpVariable.dicts("open_manufacturing", manufacturing_centers, cat='Binary')
+
+    # Fungsi tujuan
+    transport_cost_expr = pulp.lpSum(Amn[m,n] * distance_matrix.loc[m,n] * transport_cost for m in repair_centers for n in cascade_centers) + \
+    pulp.lpSum(Aqw[q,w] * distance_matrix.loc[q,w] * transport_cost for q in recycling_centers for w in manufacturing_centers) + \
+    pulp.lpSum(Aqu[q,u] * distance_matrix.loc[q,u] * transport_cost for q in recycling_centers for u in waste_centers)
+
+    fixed_cost_expr = pulp.lpSum(yn[n] * fixed_costs['Cascade Utilization'] for n in cascade_centers) + \
+    pulp.lpSum(yw[w] * fixed_costs['Manufacturing Center'] for w in manufacturing_centers)
+
+    processing_cost_expr = pulp.lpSum(Amn[m,n] * processing_costs['Cascade Utilization'] for m in repair_centers for n in cascade_centers) + \
+    pulp.lpSum(Aqw[q,w] * processing_costs['Manufacturing Center'] for q in recycling_centers for w in manufacturing_centers) + \
+    pulp.lpSum(Aqu[q,u] * processing_costs['Waste Treatment'] for q in recycling_centers for u in waste_centers)
+
+    carbon_emission_expr = pulp.lpSum(Amn[m,n] * distance_matrix.loc[m,n] * carbon_factor for m in repair_centers for n in cascade_centers) + \
+    pulp.lpSum(Aqw[q,w] * distance_matrix.loc[q,w] * carbon_factor for q in recycling_centers for w in manufacturing_centers) + \
+    pulp.lpSum(Aqu[q,u] * distance_matrix.loc[q,u] * carbon_factor for q in recycling_centers for u in waste_centers)
+
+    model += transport_cost_expr + fixed_cost_expr + processing_cost_expr + (30000 * carbon_emission_expr)
+
+    # PERBAIKAN: Constraint keseimbangan yang ketat
+    # Repair Center → Cascade Utilization (100% dari input)
+    for m in repair_centers:
+        total_in = sum([flow for (k,mm), flow in testing_to_repair_dismantling_flows.items() if mm == m])
+        model += pulp.lpSum(Amn[m,n] for n in cascade_centers) == total_in, f"Balance_Repair_{m}"
+    
+    # Recycling Center → Manufacturing + Waste (100% dari input dengan proporsi yang benar)
+    for q in recycling_centers:
+        total_in = sum([flow for (p,qq), flow in dismantling_to_recycling_waste_flows.items() if qq == q])
+        
+        # Constraint keseimbangan total
+        model += (pulp.lpSum(Aqw[q,w] for w in manufacturing_centers) + 
+                  pulp.lpSum(Aqu[q,u] for u in waste_centers)) == total_in, f"Balance_Recycling_{q}"
+        
+        # PERBAIKAN: Tambahkan constraint proporsi yang ketat
+        # Minimal 85% ke Manufacturing Center
+        model += pulp.lpSum(Aqw[q,w] for w in manufacturing_centers) >= theta1[0] * total_in, f"Min_Manufacturing_{q}"
+        # Maksimal 95% ke Manufacturing Center
+        model += pulp.lpSum(Aqw[q,w] for w in manufacturing_centers) <= theta1[2] * total_in, f"Max_Manufacturing_{q}"
+        
+        # Minimal 5% ke Waste Treatment
+        model += pulp.lpSum(Aqu[q,u] for u in waste_centers) >= theta2[0] * total_in, f"Min_Waste_Recycling_{q}"
+        # Maksimal 15% ke Waste Treatment
+        model += pulp.lpSum(Aqu[q,u] for u in waste_centers) <= theta2[2] * total_in, f"Max_Waste_Recycling_{q}"
+
+    # Kapasitas cascade utilization
+    for n in cascade_centers:
+        model += pulp.lpSum(Amn[m,n] for m in repair_centers) <= capacity_params['Cascade Utilization'] * yn[n]
+
+    # Kapasitas manufacturing center
+    for w in manufacturing_centers:
+        model += pulp.lpSum(Aqw[q,w] for q in recycling_centers) <= capacity_params['Manufacturing Center'] * yw[w]
+
+    # Minimal 1 cascade dan 1 manufacturing dibuka
+    model += pulp.lpSum(yn[n] for n in cascade_centers) >= 1
+    model += pulp.lpSum(yw[w] for w in manufacturing_centers) >= 1
+
+    # Solve model
+    model.solve()
+
+    # Tampilkan hasil
+    print(f"Status: {pulp.LpStatus[model.status]}")
+    print(f"Total Cost: Rp {pulp.value(model.objective):,.2f}")
+
+    # Debug proporsi hasil
+    print("\n=== DEBUG PROPORSI MANUFACTURING vs WASTE (dari Recycling) ===")
+    total_manufacturing = 0
+    total_waste_from_recycling = 0
+    
+    for q in recycling_centers:
+        total_in = sum([flow for (p,qq), flow in dismantling_to_recycling_waste_flows.items() if qq == q])
+        manufacturing_out = sum([pulp.value(Aqw[q,w]) for w in manufacturing_centers])
+        waste_out = sum([pulp.value(Aqu[q,u]) for u in waste_centers])
+        
+        total_manufacturing += manufacturing_out
+        total_waste_from_recycling += waste_out
+        
+        print(f"Recycling Center {q}:")
+        print(f"  Total Input: {total_in:.0f} ton")
+        print(f"  Ke Manufacturing: {manufacturing_out:.0f} ton ({manufacturing_out/total_in*100:.1f}%)")
+        print(f"  Ke Waste: {waste_out:.0f} ton ({waste_out/total_in*100:.1f}%)")
+        print()
+    
+    total_all = total_manufacturing + total_waste_from_recycling
+    print(f"TOTAL KESELURUHAN:")
+    print(f"  Ke Manufacturing: {total_manufacturing:.0f} ton ({total_manufacturing/total_all*100:.1f}%)")
+    print(f"  Ke Waste: {total_waste_from_recycling:.0f} ton ({total_waste_from_recycling/total_all*100:.1f}%)")
+    print("=" * 50)
+
+    # Simpan hasil alur dengan pembulatan
+    flows = {}
+    for m in repair_centers:
+        for n in cascade_centers:
+            if pulp.value(Amn[m,n]) > 0:
+                rounded_value = round(pulp.value(Amn[m,n]))
+                flows[(m,n)] = rounded_value
+    for q in recycling_centers:
+        for w in manufacturing_centers:
+            if pulp.value(Aqw[q,w]) > 0:
+                rounded_value = round(pulp.value(Aqw[q,w]))
+                flows[(q,w)] = rounded_value
+        for u in waste_centers:
+            if pulp.value(Aqu[q,u]) > 0:
+                rounded_value = round(pulp.value(Aqu[q,u]))
+                flows[(q,u)] = rounded_value
+
+    # Visualisasi hasil
+    m = create_flow_map(df_facilities, flows, "Repair to Cascade, Recycling to Waste/Manufacturing Flow", "repair_to_cascade_recycling_to_waste_manufacturing")
+
+    # Simpan hasil ke Excel
+    results_df = pd.DataFrame([
+        {
+            'Source': m,
+            'Target': n,
+            'Volume': flows[(m,n)],
+            'Distance': distance_matrix.loc[m,n],
+            'Transport Cost': flows[(m,n)] * distance_matrix.loc[m,n] * transport_cost,
+            'Carbon Emission': flows[(m,n)] * distance_matrix.loc[m,n] * carbon_factor
+        }
+        for m in repair_centers for n in cascade_centers
+        if (m,n) in flows
+    ] + [
+        {
+            'Source': q,
+            'Target': w,
+            'Volume': flows[(q,w)],
+            'Distance': distance_matrix.loc[q,w],
+            'Transport Cost': flows[(q,w)] * distance_matrix.loc[q,w] * transport_cost,
+            'Carbon Emission': flows[(q,w)] * distance_matrix.loc[q,w] * carbon_factor
+        }
+        for q in recycling_centers for w in manufacturing_centers
+        if (q,w) in flows
+    ] + [
+        {
+            'Source': q,
+            'Target': u,
+            'Volume': flows[(q,u)],
+            'Distance': distance_matrix.loc[q,u],
+            'Transport Cost': flows[(q,u)] * distance_matrix.loc[q,u] * transport_cost,
+            'Carbon Emission': flows[(q,u)] * distance_matrix.loc[q,u] * carbon_factor
+        }
+        for q in recycling_centers for u in waste_centers
+        if (q,u) in flows
+    ])
+
+    results_df.to_excel('repair_to_cascade_recycling_to_waste_manufacturing_results.xlsx', index=False)
+
+    debug_node_balance(flows, cascade_centers + manufacturing_centers + waste_centers, "Cascade/Manufacturing/Waste Center")
+
+    return flows, results_df
+
+def create_summary_report(all_flows):
+    """
+    Membuat laporan ringkasan hasil optimasi
+    """
+    print("=" * 60)
+    print("LAPORAN RINGKASAN OPTIMASI SISTEM DAUR ULANG BATERAI")
+    print("=" * 60)
+    
+    # Hitung total volume per jenis fasilitas
+    facility_types = df_facilities['Fasilitas'].unique()
+    
+    for facility_type in facility_types:
+        facility_ids = df_facilities[df_facilities['Fasilitas'] == facility_type]['ID'].tolist()
+        total_in = sum([v for (src, tgt), v in all_flows.items() if tgt in facility_ids])
+        total_out = sum([v for (src, tgt), v in all_flows.items() if src in facility_ids])
+        
+        print(f"\n{facility_type}:")
+        print(f"  Total Volume Masuk: {total_in:.0f} ton")
+        print(f"  Total Volume Keluar: {total_out:.0f} ton")
+        print(f"  Keseimbangan: {'✅ SEIMBANG' if abs(total_in - total_out) < 0.01 else '❌ TIDAK SEIMBANG'}")
+    
+    # Hitung total biaya
+    total_transport_cost = sum([v * distance_matrix.loc[src, tgt] * transport_cost 
+                               for (src, tgt), v in all_flows.items()])
+    
+    print(f"\n{'='*60}")
+    print("TOTAL BIAYA TRANSPORTASI: Rp {:.2f}".format(total_transport_cost))
+    print("=" * 60)
+
+def save_complete_results(all_flows):
+    """
+    Menyimpan semua hasil ke file Excel yang lengkap
+    """
+    # Buat DataFrame untuk semua flows
+    all_results = []
+    
+    for (source, target), volume in all_flows.items():
+        source_row = df_facilities[df_facilities['ID'] == source].iloc[0]
+        target_row = df_facilities[df_facilities['ID'] == target].iloc[0]
+        
+        distance = distance_matrix.loc[source, target]
+        transport_cost_val = volume * distance * transport_cost
+        carbon_emission_val = volume * distance * carbon_factor
+        
+        all_results.append({
+            'Source_ID': source,
+            'Source_Facility': source_row['Fasilitas'],
+            'Source_Location': source_row['Nama_Lokasi'],
+            'Target_ID': target,
+            'Target_Facility': target_row['Fasilitas'],
+            'Target_Location': target_row['Nama_Lokasi'],
+            'Volume_Ton': volume,
+            'Distance_km': distance,
+            'Transport_Cost_Rp': transport_cost_val,
+            'Carbon_Emission_TonCO2': carbon_emission_val
+        })
+    
+    df_complete = pd.DataFrame(all_results)
+    df_complete.to_excel('hasil_optimasi_lengkap.xlsx', index=False)
+    print("Hasil optimasi lengkap telah disimpan di 'hasil_optimasi_lengkap.xlsx'")
+
+# Jalankan optimasi untuk semua alur
+if __name__ == "__main__":
+    print("�� MEMULAI OPTIMASI SISTEM DAUR ULANG BATERAI")
+    print("=" * 60)
+    
+    # Alur 1: Collection → Testing
+    print("\n�� Alur 1: Collection → Testing")
+    flows1, results1 = optimize_collection_to_testing(df_volume)
+
+    # Alur 2: Testing → Repair/Dismantling
+    print("\n📊 Alur 2: Testing → Repair/Dismantling")
+    flows2, results2 = optimize_testing_to_repair_dismantling(df_volume, flows1)
+
+    # Alur 3: Dismantling → Recycling/Waste
+    print("\n📊 Alur 3: Dismantling → Recycling/Waste")
+    flows3, results3 = optimize_dismantling_to_recycling_waste(flows2)
+
+    # Alur 4: Repair → Cascade, Recycling → Waste/Manufacturing
+    print("\n📊 Alur 4: Repair → Cascade, Recycling → Waste/Manufacturing")
+    flows4, results4 = optimize_repair_to_cascade_recycling_to_waste_manufacturing(flows2, flows3)
+
+    # Gabungkan semua flows untuk validasi
+    all_flows = {**flows1, **flows2, **flows3, **flows4}
+    
+    # Validasi keseimbangan
+    print("\n🔍 VALIDASI KESEIMBANGAN FLOW")
+    validate_flow_balance(all_flows)
+    
+    # Buat laporan ringkasan
+    print("\n📋 LAPORAN RINGKASAN")
+    create_summary_report(all_flows)
+    
+    # Simpan hasil lengkap
+    print("\n�� MENYIMPAN HASIL")
+    save_complete_results(all_flows)
+    
+    # Uji Sensitivitas (opsional)
+    print("\n📈 Uji Sensitivitas Komponen")
+    try:
+        df_sens_results = uji_sensitivitas_komponen(df_volume)
+        
+        print("\n📊 Plot Sensitivitas Jurnal Style")
+        plot_sensitivitas_jurnal_style(df_sens_results)
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Volume Factor)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Volume_Factor', 
+                                       fixed_values={'Alpha': 0.85, 'Omega1': 0.6})
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Alpha)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Alpha', 
+                                       fixed_values={'Volume_Factor': 1.0, 'Omega1': 0.6})
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Omega1)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Omega1', 
+                                       fixed_values={'Volume_Factor': 1.0, 'Alpha': 0.85})
+        
+    except Exception as e:
+        print(f"⚠️  Uji sensitivitas gagal: {e}")
+        print("Lanjutkan tanpa uji sensitivitas...")
+    
+    print("\n✅ OPTIMASI SELESAI!")
+    print("=" * 60)
+    print("File yang dihasilkan:")
+    print("- collection_to_testing_results.xlsx")
+    print("- testing_to_repair_dismantling_results.xlsx")
+    print("- dismantling_to_recycling_waste_results.xlsx")
+    print("- repair_to_cascade_recycling_to_waste_manufacturing_results.xlsx")
+    print("- hasil_optimasi_lengkap.xlsx")
+    print("- uji_sensitivitas_komponen.xlsx (jika berhasil)")
+    print("- File HTML untuk visualisasi peta")
+    print("=" * 60)
+
+def uji_sensitivitas_komponen(
+    df_volume,
+    volume_factors=[0.8, 1.0, 1.2],
+    alpha_values=[0.7, 0.85, 0.95],
+    omega1_values=[0.42, 0.48, 0.54, 0.6, 0.66, 0.72, 0.78]
+):
+    """
+    Uji sensitivitas untuk volume, alpha, dan omega1 (proporsi Testing->Repair),
+    menyimpan hasil komponen biaya dan menampilkan grafik bar multi-komponen.
+    """
+    results = []
+    original_volume = df_volume.copy()
+    
+    for vol_factor, alpha, omega1 in itertools.product(volume_factors, alpha_values, omega1_values):
+        # Update volume
+        df_volume_mod = original_volume.copy()
+        df_volume_mod['Volume_(Ton)'] = original_volume['Volume_(Ton)'] * vol_factor
+        
+        # Jalankan alur 1 (Collection to Testing) untuk dapatkan flows
+        flows1, _ = optimize_collection_to_testing(df_volume_mod)
+        
+        # Jalankan alur 2 (Testing to Repair/Dismantling) dengan omega1 dan alpha
+        testing_centers = df_facilities[df_facilities['Fasilitas'] == 'Testing Center']['ID'].tolist()
+        repair_centers = df_facilities[df_facilities['Fasilitas'] == 'Repair Center']['ID'].tolist()
+        dismantling_centers = df_facilities[df_facilities['Fasilitas'] == 'Dismantling Center']['ID'].tolist()
+        
+        # omega1 fuzzy
+        omega1_tuple = (omega1-0.05, omega1, omega1+0.05)
+        omega2_tuple = (1-omega1_tuple[2], 1-omega1_tuple[1], 1-omega1_tuple[0])
+        omega1_val = (1-alpha)*omega1_tuple[0] + alpha*omega1_tuple[1]
+        omega2_val = (1-alpha)*omega2_tuple[0] + alpha*omega2_tuple[1]
+        
+        model = pulp.LpProblem("Testing_to_Repair_Dismantling_Optimization", pulp.LpMinimize)
+        Akm = pulp.LpVariable.dicts("Akm", ((k, m) for k in testing_centers for m in repair_centers), lowBound=0, cat='Continuous')
+        Akp = pulp.LpVariable.dicts("Akp", ((k, p) for k in testing_centers for p in dismantling_centers), lowBound=0, cat='Continuous')
+        ym = pulp.LpVariable.dicts("open_repair", repair_centers, cat='Binary')
+        yp = pulp.LpVariable.dicts("open_dismantling", dismantling_centers, cat='Binary')
+        
+        # Komponen biaya
+        transport_cost_expr = pulp.lpSum(Akm[k,m] * distance_matrix.loc[k,m] * transport_cost for k in testing_centers for m in repair_centers) + \
+            pulp.lpSum(Akp[k,p] * distance_matrix.loc[k,p] * transport_cost for k in testing_centers for p in dismantling_centers)
+        fixed_cost_expr = pulp.lpSum(ym[m] * fixed_costs['Repair Center'] for m in repair_centers) + \
+            pulp.lpSum(yp[p] * fixed_costs['Dismantling Center'] for p in dismantling_centers)
+        processing_cost_expr = pulp.lpSum(Akm[k,m] * processing_costs['Repair Center'] for k in testing_centers for m in repair_centers) + \
+            pulp.lpSum(Akp[k,p] * processing_costs['Dismantling Center'] for k in testing_centers for p in dismantling_centers)
+        carbon_emission_expr = pulp.lpSum(Akm[k,m] * distance_matrix.loc[k,m] * carbon_factor for k in testing_centers for m in repair_centers) + \
+            pulp.lpSum(Akp[k,p] * distance_matrix.loc[k,p] * carbon_factor for k in testing_centers for p in dismantling_centers)
+        
+        model += transport_cost_expr + fixed_cost_expr + processing_cost_expr + (30000 * carbon_emission_expr)
+        
+        # PERBAIKAN: Constraint keseimbangan yang ketat
+        for k in testing_centers:
+            total_in = sum([flow for (i,j), flow in flows1.items() if j == k])
+            model += (pulp.lpSum(Akm[k,m] for m in repair_centers) + 
+                      pulp.lpSum(Akp[k,p] for p in dismantling_centers)) == total_in, f"Balance_Testing_{k}"
+        
+        # Kapasitas
+        for m in repair_centers:
+            model += pulp.lpSum(Akm[k,m] for k in testing_centers) <= capacity_params['Repair Center'] * ym[m]
+        for p in dismantling_centers:
+            model += pulp.lpSum(Akp[k,p] for k in testing_centers) <= capacity_params['Dismantling Center'] * yp[p]
+        
+        model += pulp.lpSum(ym[m] for m in repair_centers) >= 2
+        model += pulp.lpSum(yp[p] for p in dismantling_centers) >= 2
+        
+        model.solve()
+        status = pulp.LpStatus[model.status]
+        
+        # Check if the model is solved before accessing the objective
+        if model.status == 1: # Check if optimal solution is found
+            total_cost = pulp.value(model.objective)
+            transport_cost_val = pulp.value(transport_cost_expr)
+            fixed_cost_val = pulp.value(fixed_cost_expr)
+            processing_cost_val = pulp.value(processing_cost_expr)
+            emission_cost_val = pulp.value(carbon_emission_expr) * 30000
+        else:
+            total_cost = None
+            transport_cost_val = None
+            fixed_cost_val = None
+            processing_cost_val = None
+            emission_cost_val = None
+
+        results.append({
+            'Volume_Factor': vol_factor,
+            'Alpha': alpha,
+            'Omega1': omega1,
+            'Status': status,
+            'Total_Cost': total_cost,
+            'Transport_Cost': transport_cost_val,
+            'Fixed_Cost': fixed_cost_val,
+            'Processing_Cost': processing_cost_val,
+            'Emission_Cost': emission_cost_val
+        })
+    
+    # Kembalikan volume ke semula
+    df_volume = original_volume
+    
+    # Simpan ke DataFrame dan Excel
+    df_results = pd.DataFrame(results)
+    df_results.to_excel('uji_sensitivitas_komponen.xlsx', index=False)
+    print(df_results)
+    
+    # Visualisasi bar chart multi-komponen
+    # Grafik 1: Komponen biaya vs Volume_Factor
+    for alpha in alpha_values:
+        for omega1 in omega1_values:
+            df_plot = df_results[(df_results['Alpha']==alpha) & (df_results['Omega1']==omega1)]
+            if not df_plot.empty:
+                df_plot = df_plot.sort_values('Volume_Factor')
+                df_plot.set_index('Volume_Factor')[['Fixed_Cost','Transport_Cost','Processing_Cost','Emission_Cost']].plot(kind='bar', stacked=False)
+                plt.title(f'Komponen Biaya vs Volume (alpha={alpha}, omega1={omega1})')
+                plt.ylabel('Cost')
+                plt.xlabel('Volume Factor')
+                plt.tight_layout()
+                plt.show()
+    
+    # Grafik 2: Komponen biaya vs Alpha
+    for vol_factor in volume_factors:
+        for omega1 in omega1_values:
+            df_plot = df_results[(df_results['Volume_Factor']==vol_factor) & (df_results['Omega1']==omega1)]
+            if not df_plot.empty:
+                df_plot = df_plot.sort_values('Alpha')
+                df_plot.set_index('Alpha')[['Fixed_Cost','Transport_Cost','Processing_Cost','Emission_Cost']].plot(kind='bar', stacked=False)
+                plt.title(f'Komponen Biaya vs Alpha (volume={vol_factor}, omega1={omega1})')
+                plt.ylabel('Cost')
+                plt.xlabel('Alpha')
+                plt.tight_layout()
+                plt.show()
+    
+    # Grafik 3: Komponen biaya vs Omega1
+    for vol_factor in volume_factors:
+        for alpha in alpha_values:
+            df_plot = df_results[(df_results['Volume_Factor']==vol_factor) & (df_results['Alpha']==alpha)]
+            if not df_plot.empty:
+                df_plot = df_plot.sort_values('Omega1')
+                df_plot.set_index('Omega1')[['Fixed_Cost','Transport_Cost','Processing_Cost','Emission_Cost']].plot(kind='bar', stacked=False)
+                plt.title(f'Komponen Biaya vs Omega1 (volume={vol_factor}, alpha={alpha})')
+                plt.ylabel('Cost')
+                plt.xlabel('Omega1')
+                plt.tight_layout()
+                plt.show()
+    
+    return df_results
+
+def plot_sensitivitas_jurnal_style(df_results_sens, volume_factor=1, omega1=0.6):
+    """
+    Membuat grafik bar multi-komponen vs alpha (confidence level) seperti pada jurnal,
+    untuk satu kombinasi volume_factor dan omega1 tertentu.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Filter data
+    df_plot = df_results_sens[(df_results_sens['Volume_Factor']==volume_factor) & (df_results_sens['Omega1']==omega1)]
+    df_plot = df_plot.sort_values('Alpha')
+    alphas = df_plot['Alpha'].values
+    
+    # Komponen biaya
+    komponen = ['Fixed_Cost', 'Transport_Cost', 'Processing_Cost', 'Emission_Cost']
+    labels = ['Annual fixed costs', 'Transport costs', 'Facility processing costs', 'Carbon emissions costs']
+    data = [df_plot[k].values/1e8 for k in komponen]  # Bagi biar skalanya mirip jurnal (atau sesuaikan)
+    
+    x = np.arange(len(alphas))
+    width = 0.18
+    fig, ax = plt.subplots(figsize=(10,6))
+    
+    for i, (d, label) in enumerate(zip(data, labels)):
+        ax.bar(x + i*width, d, width, label=label)
+    
+    ax.set_xticks(x + 1.5*width)
+    ax.set_xticklabels([f"{a:.2f}" for a in alphas])
+    ax.set_xlabel('Confidence Level (Alpha)')
+    ax.set_ylabel('Cost (x10^8)')
+    ax.set_title('The values of different costs under different confidence levels')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+def plot_sensitivitas_per_parameter(df_results_sens, param='Volume_Factor', fixed_values={}):
+    """
+    Membuat grafik sensitivitas per parameter (volume, alpha, atau omega1).
+    param: parameter yang ingin divisualisasikan ('Volume_Factor', 'Alpha', atau 'Omega1')
+    fixed_values: dict, parameter lain yang ingin di-fix, misal {'Alpha': 0.85, 'Omega1': 0.6}
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Mapping nama kolom jika perlu (misal ada spasi)
+    col_map = {c.lower().replace(' ', '_'): c for c in df_results_sens.columns}
+    param_col = col_map.get(param.lower(), param)
+    
+    # Filter data sesuai fixed_values
+    df_plot = df_results_sens.copy()
+    for k, v in fixed_values.items():
+        k_col = col_map.get(k.lower(), k)
+        df_plot = df_plot[df_plot[k_col] == v]
+    
+    df_plot = df_plot.sort_values(param_col)
+    x_vals = df_plot[param_col].values
+    
+    komponen = ['Fixed_Cost', 'Transport_Cost', 'Processing_Cost', 'Emission_Cost']
+    labels = ['Annual fixed costs', 'Transport costs', 'Facility processing costs', 'Carbon emissions costs']
+    data = [df_plot[k].values/1e8 for k in komponen]
+    
+    x = np.arange(len(x_vals))
+    width = 0.18
+    fig, ax = plt.subplots(figsize=(10,6))
+    
+    for i, (d, label) in enumerate(zip(data, labels)):
+        ax.bar(x + i*width, d, width, label=label)
+    
+    ax.set_xticks(x + 1.5*width)
+    ax.set_xticklabels([f"{a}" for a in x_vals])
+    ax.set_xlabel(param.replace('_', ' '))
+    ax.set_ylabel('Cost (x10^8)')
+    ax.set_title(f'Sensitivitas komponen biaya terhadap {param.replace("_", " ")}')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Jalankan script
+if __name__ == "__main__":
+    print("�� MEMULAI OPTIMASI SISTEM DAUR ULANG BATERAI")
+    print("=" * 60)
+    
+    # Alur 1: Collection → Testing
+    print("\n�� Alur 1: Collection → Testing")
+    flows1, results1 = optimize_collection_to_testing(df_volume)
+
+    # Alur 2: Testing → Repair/Dismantling
+    print("\n📊 Alur 2: Testing → Repair/Dismantling")
+    flows2, results2 = optimize_testing_to_repair_dismantling(df_volume, flows1)
+
+    # Alur 3: Dismantling → Recycling/Waste
+    print("\n📊 Alur 3: Dismantling → Recycling/Waste")
+    flows3, results3 = optimize_dismantling_to_recycling_waste(flows2)
+
+    # Alur 4: Repair → Cascade, Recycling → Waste/Manufacturing
+    print("\n📊 Alur 4: Repair → Cascade, Recycling → Waste/Manufacturing")
+    flows4, results4 = optimize_repair_to_cascade_recycling_to_waste_manufacturing(flows2, flows3)
+
+    # Gabungkan semua flows untuk validasi
+    all_flows = {**flows1, **flows2, **flows3, **flows4}
+    
+    # Validasi keseimbangan
+    print("\n🔍 VALIDASI KESEIMBANGAN FLOW")
+    validate_flow_balance(all_flows)
+    
+    # Buat laporan ringkasan
+    print("\n📋 LAPORAN RINGKASAN")
+    create_summary_report(all_flows)
+    
+    # Simpan hasil lengkap
+    print("\n�� MENYIMPAN HASIL")
+    save_complete_results(all_flows)
+    
+    # Uji Sensitivitas (opsional)
+    print("\n📈 Uji Sensitivitas Komponen")
+    try:
+        df_sens_results = uji_sensitivitas_komponen(df_volume)
+        
+        print("\n📊 Plot Sensitivitas Jurnal Style")
+        plot_sensitivitas_jurnal_style(df_sens_results)
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Volume Factor)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Volume_Factor', 
+                                       fixed_values={'Alpha': 0.85, 'Omega1': 0.6})
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Alpha)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Alpha', 
+                                       fixed_values={'Volume_Factor': 1.0, 'Omega1': 0.6})
+        
+        print("\n📊 Plot Sensitivitas per Parameter (Omega1)")
+        plot_sensitivitas_per_parameter(df_sens_results, param='Omega1', 
+                                       fixed_values={'Volume_Factor': 1.0, 'Alpha': 0.85})
+        
+    except Exception as e:
+        print(f"⚠️  Uji sensitivitas gagal: {e}")
+        print("Lanjutkan tanpa uji sensitivitas...")
+    
+    print("\n✅ OPTIMASI SELESAI!")
+    print("=" * 60)
+    print("File yang dihasilkan:")
+    print("- collection_to_testing_results.xlsx")
+    print("- testing_to_repair_dismantling_results.xlsx")
+    print("- dismantling_to_recycling_waste_results.xlsx")
+    print("- repair_to_cascade_recycling_to_waste_manufacturing_results.xlsx")
+    print("- hasil_optimasi_lengkap.xlsx")
+    print("- uji_sensitivitas_komponen.xlsx (jika berhasil)")
+    print("- File HTML untuk visualisasi peta")
+    print("=" * 60)
