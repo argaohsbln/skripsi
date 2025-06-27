@@ -1,0 +1,36 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+# Baca data
+df = pd.read_csv('TES.csv', sep=';', header=None, encoding='latin1')
+years = [int(y) for y in df.iloc[1,1:] if str(y).strip() != '']
+start_year = years[0]
+end_year = 2030
+all_years = list(range(start_year, end_year+1))
+
+data_dict = {}
+
+for i in range(2, df.shape[0]):
+    label = df.iloc[i,0].strip()
+    data = [float(str(x).replace(',','.')) for x in df.iloc[i,1:len(years)+1]]
+    s = pd.Series(data, index=years)
+    try:
+        model = ExponentialSmoothing(s, trend='add', seasonal=None, initialization_method='estimated')
+        fit = model.fit()
+        n_forecast = end_year - years[-1]
+        forecast = fit.forecast(n_forecast)
+        full_series = pd.concat([s, forecast])
+        data_dict[label] = full_series.values
+    except Exception as e:
+        print(f"Error untuk {label}: {e}")
+
+df_out = pd.DataFrame(data_dict, index=all_years).T
+df_out.insert(0, 'Tahun', df_out.index)
+df_out.reset_index(drop=True, inplace=True)
+
+# Ganti hasil negatif dengan 0
+df_out.iloc[:, 1:] = df_out.iloc[:, 1:].clip(lower=0)
+
+df_out.to_excel('hasil_triple_exponential_smoothing.xlsx', index=False)
+print('Hasil ramalan triple exponential smoothing telah disimpan di hasil_triple_exponential_smoothing.xlsx')
